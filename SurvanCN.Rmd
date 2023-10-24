@@ -1,0 +1,972 @@
+---
+title: "Survival analysis"
+author: " Lara Rosetta"
+output: pdf_document
+---
+# Prepare environment 
+
+## Load packages
+
+```{r}
+library(mstate) # to perform the analysis
+library(colorspace) # colouring plots 
+#library(gtools) # categorize continuous variables
+```
+```{r}
+rm(baseline)
+```
+
+# Data preparation 
+
+## Transition matrix  
+
+```{r}
+tmat_CN <- transMat(x = list(c(2,4,5), 
+                             c(3,4,5),
+                             c(4,5),
+                             c(5),
+                             c()),
+                    names = c("CN", "MCI", "MCI+", "Dementia", "Death"))
+```
+
+
+## Categorizing numeric variables 
+
+Because of convergence problems found in previous versions of the code, the decision was made to convert numerical variables to categorical. This will be done using the lower and upper $50\%$-quantiles, and is done in the chunk below. 
+
+```{r}
+# save the original dataframe
+adni_final_num <- adni_final
+
+# categorize continuous variables
+cont <- c("MMSE", "RAVLT.immediate", "RAVLT.forgetting", 
+          "TRABSCOR", "FAQ", "Ventricles",
+          "Hippocampus", "Fusiform", "ICV")
+
+adni_final[,cont] <- apply(adni_final[,cont], 2, function(x) quantcut(x, q = 2, na.rm = TRUE))
+
+adni_final <- adni_final %>%
+  mutate(AGE = round(AGE),
+         APOE4 = as.factor(APOE4))
+
+# change quantiles to ascending factors
+quant_values <- as.data.frame(apply(adni_final[,cont], 2, unique)) %>%
+  filter(!is.na(MMSE))
+
+for(i in colnames(quant_values)){
+  if(i == "Ventricles" | i == "ICV" | i == "FAQ" | i == "TRABSCOR") quant_values[,i] = quant_values[c(2,1),i]
+}
+
+for(i in colnames(quant_values)){
+  adni_final[,i] = factor(adni_final[,i], levels = quant_values[,i], 
+                          labels = c("quant1","quant2"))
+}
+
+rm(cont)
+```
+
+
+## Data formatting to wide 
+
+Before we can use the msprep function, we need the data to be in a suitable wide format.
+
+```{r}
+# save last follow-up time
+maxtime <- adni_final %>% 
+  select(RID, Year.bl) %>%
+  arrange(RID, desc(Year.bl)) %>%
+  filter(!duplicated(RID))
+
+# start and stop for each DX 
+startstop <- adni_final %>% 
+  arrange(RID, Year.bl) %>%
+  select(RID, DX, Year.bl)
+
+for(i in 1:(nrow(startstop)-1)){
+  if(startstop[i, "RID"] == startstop[i+1, "RID"] &
+     startstop[i, "DX"] == startstop[i+1, "DX"]){
+    startstop[i, "startstop"] = paste0(startstop[i, "DX"], ".start")
+    startstop[i+1, "startstop"] = paste0(startstop[i+1, "DX"], ".stop")
+  }
+}
+
+startstop$startstop <- ifelse(is.na(startstop$startstop), 
+                              paste0(startstop$DX, ".start"), 
+                              startstop$startstop)
+
+startstop <- startstop %>% 
+  arrange(RID, Year.bl) %>%
+  select(RID, startstop, Year.bl) 
+
+# mutate data to wide format 
+wide <- reshape(startstop, idvar = "RID", timevar = "startstop", 
+                      direction = "wide") %>%
+  rename(CN.time = Year.bl.CN.start,
+         MCI.time = Year.bl.MCI.start,
+         MCIplus.time = `Year.bl.MCI+.start`,
+         Dementia.time = Year.bl.Dementia.start,
+         Death.time = Year.bl.Death.start) %>%
+  mutate(CN.stat = ifelse(!is.na(CN.time), 1, 0),
+         MCI.stat = ifelse(!is.na(MCI.time), 1, 0),
+         MCIplus.stat = ifelse(!is.na(MCIplus.time), 1, 0),
+         Dementia.stat = ifelse(!is.na(Dementia.time), 1, 0),
+         Death.stat = ifelse(!is.na(Death.time), 1, 0)) %>%
+  select(RID, CN.time, CN.stat, MCI.time, MCI.stat, MCIplus.time, MCIplus.stat,
+         Dementia.time, Dementia.stat, Death.time, Death.stat)
+
+wide <- left_join(wide, maxtime) %>%
+  mutate(CN.time = ifelse(CN.stat == 0, Year.bl, CN.time),
+         MCI.time = ifelse(MCI.stat == 0, Year.bl, MCI.time),
+         MCIplus.time = ifelse(MCIplus.stat == 0, Year.bl, MCIplus.time),
+         Dementia.time = ifelse(Dementia.stat == 0, Year.bl, Dementia.time),
+         Death.time = ifelse(Death.stat == 0, Year.bl, Death.time), 
+         
+         CN.time = ifelse(CN.time == 0, NA, CN.time),
+         MCI.time = ifelse(MCI.time == 0, NA, MCI.time),
+         MCIplus.time = ifelse(MCIplus.time == 0, NA, MCIplus.time),
+         Dementia.time = ifelse(Dementia.time == 0, NA, Dementia.time),
+         Death.time = ifelse(Death.time == 0, NA, Death.time))
+wide$Year.bl <- NULL
+
+rm(maxtime, startstop)
+```
+
+Now, we need to add the transition specific covariate information. These variables are time-dependent, where at the first moment of (a new) diagnosis a new measurement was done for each variable. 
+
+```{r}
+# add transition specific covariates 
+adni_final <- adni_final %>%
+  arrange(RID, Year.bl)
+
+# select variables that do not change throughout
+meas_nonchanging <- adni_final[,c(1,4:10)] %>%
+  arrange(RID, PTGENDER, APOE4) %>%
+  filter(!duplicated(RID))
+
+# select CN variables 
+meas_CN <- adni_final[adni_final$DX == "CN",c(1, 11:19)] %>%
+  filter(!duplicated(RID))
+names(meas_CN)[-1] <- paste0(names(meas_CN)[-1], ".CN")
+
+# select MCI variables
+meas_MCI <- adni_final[adni_final$DX == "MCI",c(1, 11:19)] %>%
+  filter(!duplicated(RID))
+names(meas_MCI)[-1] <- paste0(names(meas_MCI)[-1], ".MCI")
+
+# select MCI+ variables
+meas_MCIplus <- adni_final[adni_final$DX == "MCI+",c(1, 11:19)] %>%
+  filter(!duplicated(RID))
+names(meas_MCIplus)[-1] <- paste0(names(meas_MCIplus)[-1], ".MCI+")
+
+# select dementia variables
+meas_dem <- adni_final[adni_final$DX == "Dementia",c(1, 11:19)] %>%
+  filter(!duplicated(RID))
+names(meas_dem)[-1] <- paste0(names(meas_dem)[-1], ".dem")
+```
+
+
+Next, we create dataframes for each diagnosis separately, and one dataframe that contains all measurements.
+
+```{r}
+# create baseline wide dataframe 
+wide <- left_join(wide, meas_nonchanging)
+
+# CN baseline dataframe
+wide_CN <- left_join(wide, meas_CN)
+
+# MCI baseline dataframe 
+wide_MCI <- left_join(wide, meas_MCI)
+wide_MCI$CN.time <- wide_MCI$CN.stat <- NULL
+
+# dementia baseline dataframe
+wide_dem <- left_join(wide, meas_dem)
+wide_dem$CN.time <- wide_dem$CN.stat <- wide_dem$MCI.time <- wide_dem$MCI.stat  <- 
+  wide_dem$MCIplus.time <- wide_dem$MCIplus.stat <- NULL
+
+# add to the overall dataframe
+wide_all <- left_join(wide, meas_CN)
+wide_all <- left_join(wide_all, meas_MCI)
+wide_all <- left_join(wide_all, meas_MCIplus)
+wide_all <- left_join(wide_all, meas_dem)
+
+rm(meas_CN, meas_MCI, meas_MCIplus, meas_dem, meas_nonchanging)
+```
+
+
+For the dataframes that contain only the CN and MCI measurements, we want to keep only the patients that had these diagnoses at baseline. So, for the `wide_CN`, we keep only the patients that were enrolled with a CN diagnosis.
+
+```{r}
+# split data on baseline diagnosis
+baseline_CN <- adni_final$RID[adni_final$Year.bl == 0 & adni_final$DX == "CN"]
+wide_CN <- wide_CN[wide_CN$RID %in% baseline_CN,]
+
+rm(baseline_CN, wide_dem, wide_MCI, wide, wide_all)
+```
+
+
+
+# Model fitting 
+
+We will be fitting the models that use only the patients with a CN diagnosis at baseline. The models will be fit both on the study, and the age scale. Starting with the study scale.
+
+## msprep 
+
+```{r}
+# covariates to be kept
+covs.CN <-  c("PTGENDER", "AGE", "APOE4", "MMSE.CN", "RAVLT.immediate.CN",
+              "RAVLT.forgetting.CN", "TRABSCOR.CN", "FAQ.CN", 
+              "Ventricles.CN", "Hippocampus.CN", "Fusiform.CN", "ICV.CN")
+
+# msprep for CN baseline 
+msCN <- msprep(data = wide_CN,
+               trans = tmat_CN,
+               time = c(NA, "MCI.time", "MCIplus.time", "Dementia.time", "Death.time"),
+               status = c(NA, "MCI.stat", "MCIplus.stat", "Dementia.stat", "Death.stat"),
+               keep = covs.CN)
+
+# expanding the covariates
+msCN <- expand.covs(msCN, covs.CN)
+```
+
+
+## Fitting the model using msfit 
+
+### Baseline CN 
+
+First, we fit a model with no covariates. 
+
+```{r}
+# msfit 
+c0.CN <- coxph(Surv(Tstart, Tstop, status) ~ strata(trans),
+               data = msCN, method = "breslow")
+msf0.CN <- msfit(object = c0.CN, vartype = "greenwood", trans = tmat_CN)
+
+# plot cumulative hazard 
+plot(msf0.CN, las = 1, 
+     xlab = "Years since CN diagnosis")
+
+# probtrans
+pt0.CN <- probtrans(msf0.CN, predt = 0, method = "greenwood")
+
+# plot stacked transition probabilities 
+pdf("studyscale_baseline.pdf")
+print(plot(pt0.CN, 
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(0,15), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F")))
+dev.off()
+```
+```{r transitions, frequencies and proportions}
+events(msCN)
+```
+
+
+Next, we fit the full model to determine the transition-specific covariate effects.
+
+```{r}
+# fit full model on categorized data 
+cfull.CN <- coxph(Surv(Tstart, Tstop, status) ~ PTGENDERMale.1 + PTGENDERMale.3 + PTGENDERMale.4 + PTGENDERMale.5 + PTGENDERMale.7 + 
+                    AGE.1 + AGE.4 + AGE.5 +
+                    APOE41.1 +
+                    APOE42.1 +
+                    MMSE.CNquant2.1 + MMSE.CNquant2.3 + MMSE.CNquant2.4 + 
+                    RAVLT.immediate.CNquant2.1 + 
+                    RAVLT.forgetting.CNquant2.1 +
+                    TRABSCOR.CNquant2.1 + 
+                    FAQ.CNquant2.1 +
+                    Ventricles.CNquant2.1 + 
+                    Hippocampus.CNquant2.1 + 
+                    Fusiform.CNquant2.1 +
+                    ICV.CNquant2.1 +
+                    strata(trans), 
+                  data = msCN, method = "breslow",
+                  control = coxph.control(iter.max = 100))
+```
+
+```{r}
+summary(cfull.CN)
+```
+
+We need to check if the proportional hazards assumption is met, or that we have problems with non-proportionality. 
+
+```{r}
+ph.assump <- cox.zph(cfull.CN)
+ph.assump
+plot(ph.assump)
+```
+
+
+### Testing the Markov assumption 
+
+Before moving on with this model, we want to check the Markov assumption. We will do that by adding the time of entering each state as covariates to the model. 
+
+```{r, eval = F}
+# make dataframe with entering times as covariates
+wide_CN_markov <- wide_CN %>%
+  mutate(MCI_entertime = ifelse(MCI.stat == 1, MCI.time, NA),
+         MCIplus_entertime = ifelse(MCIplus.stat == 1, MCIplus.time, NA),
+         Dementia_entertime = ifelse(Dementia.stat == 1, Dementia.time, NA))
+
+# msprep 
+msCN_markov <- msprep(data = wide_CN_markov,
+                      trans = tmat_CN,
+                      time = c(NA, "MCI.time", "MCIplus.time", "Dementia.time", "Death.time"),
+                      status = c(NA, "MCI.stat", "MCIplus.stat", "Dementia.stat", "Death.stat"),
+                      keep = c(covs.CN, "MCI_entertime", "MCIplus_entertime", "Dementia_entertime"))
+
+# expanding the covariates
+msCN_markov <- expand.covs(msCN_markov, c(covs.CN, "MCI_entertime", "MCIplus_entertime", "Dementia_entertime"))
+
+# fit model
+cfull.CN_markov <- coxph(Surv(Tstart, Tstop, status) ~ PTGENDERMale.1 + PTGENDERMale.3 + 
+                           PTGENDERMale.4 + PTGENDERMale.5 + PTGENDERMale.7 + 
+                           AGE.1 + AGE.4 + AGE.5 +
+                           APOE41.1 + 
+                           APOE42.1 +
+                           MMSE.CNquant2.1 + MMSE.CNquant2.3 + MMSE.CNquant2.4 +
+                           RAVLT.immediate.CNquant2.1 +
+                           RAVLT.forgetting.CNquant2.1 + 
+                           TRABSCOR.CNquant2.1 + 
+                           FAQ.CNquant2.1 +
+                           Ventricles.CNquant2.1 + 
+                           Hippocampus.CNquant2.1 + 
+                           Fusiform.CNquant2.1 +
+                           ICV.CNquant2.1 +
+                           MCI_entertime.4 + MCI_entertime.5 + # MCI_entertime.6 +
+                           MCIplus_entertime.7 + # MCIplus_entertime.8 +
+                           # Dementia_entertime.9 +
+                           strata(trans), 
+                         data = msCN_markov, method = "breslow",
+                         control = coxph.control(iter.max = 100))
+
+# model outcomes 
+summary(cfull.CN_markov)
+
+# clean environment
+rm(wide_CN_markov, msCN_markov, cfull.CN_markov)
+```
+
+
+### Probtrans for baseline CN model
+
+Next, we want to determine the transition probabilities for patients, given certain covariate values. We will make comparisons for several covariates:
+- Ages: 60 vs. 70 vs. 80 
+- Sex: male vs. female
+- MMSE: quantile 1 vs. quantile 2 
+- APOE4 allele: 0, 1, 2
+
+```{r, eval = F}
+# different ages 
+x <- unique(msCN[,c(1, 9:20)]) %>% 
+  group_by(PTGENDER, APOE4, MMSE.CN, RAVLT.immediate.CN, RAVLT.forgetting.CN, 
+           TRABSCOR.CN, FAQ.CN, Ventricles.CN, Hippocampus.CN,
+           Fusiform.CN, ICV.CN) %>% 
+  filter(n() > 1) %>%
+  arrange(.by_group = T)
+  
+y <- unique(msCN[msCN$PTGENDER == "Female" & 
+                   msCN$APOE4 == 0 &
+                   msCN$MMSE.CN == "quant2" & 
+                   msCN$RAVLT.immediate.CN == "quant2" & 
+                   msCN$RAVLT.forgetting.CN == "quant1" & 
+                   msCN$TRABSCOR.CN == "quant1" & 
+                   msCN$FAQ.CN == "quant1" & 
+                   msCN$Ventricles.CN == "quant1" &
+                   msCN$Hippocampus.CN == "quant2" &
+                   msCN$Fusiform.CN == "quant2" &
+                   msCN$ICV.CN == "quant1", 
+                 c(1, 9:20)]) %>%
+  filter(!is.na(id))
+
+# choose c(598, 545, 619) (59 vs. 69 vs. 81) likely (599, 545, 620)
+
+# different genders 
+x <- unique(msCN[,c(1, 9:20)]) %>% 
+  group_by(AGE, APOE4, MMSE.CN, RAVLT.immediate.CN, RAVLT.forgetting.CN, 
+           TRABSCOR.CN, FAQ.CN, Ventricles.CN, Hippocampus.CN,
+           Fusiform.CN, ICV.CN) %>% 
+  filter(n() > 1) %>%
+  arrange(.by_group = T)
+  
+y <- unique(msCN[msCN$AGE == 66 & 
+                   msCN$APOE4 == 0 &
+                   msCN$MMSE.CN == "quant2" & 
+                   msCN$RAVLT.immediate.CN == "quant2" & 
+                   msCN$RAVLT.forgetting.CN == "quant1" &
+                   msCN$TRABSCOR.CN == "quant1" &
+                   msCN$FAQ.CN == "quant1" & 
+                   msCN$Ventricles.CN == "quant1" &
+                   msCN$Hippocampus.CN == "quant2" &
+                   msCN$Fusiform.CN == "quant2" &
+                   msCN$ICV.CN == "quant2", 
+                 c(1, 9:20)]) %>%
+  filter(!is.na(id))
+
+# c(323, 637) (Male vs. Female)  likely(323, 639)
+
+# different MMSE quantiles 
+x <- unique(msCN[,c(1, 9:20)]) %>% 
+  group_by(PTGENDER, AGE, APOE4, RAVLT.immediate.CN, RAVLT.forgetting.CN, 
+           TRABSCOR.CN, FAQ.CN, Ventricles.CN, Hippocampus.CN,
+           Fusiform.CN, ICV.CN) %>% 
+  filter(n() > 1) %>%
+  arrange(.by_group = T)
+
+y <- unique(msCN[msCN$PTGENDER == "Female" & 
+                   msCN$AGE == 66 & 
+                   msCN$APOE4 == 1 &
+                   msCN$RAVLT.immediate.CN == "quant2" & 
+                   msCN$RAVLT.forgetting.CN == "quant1" & 
+                   msCN$TRABSCOR.CN == "quant1" & 
+                   msCN$FAQ.CN == "quant1" & 
+                   msCN$Ventricles.CN == "quant1" &
+                   msCN$Hippocampus.CN == "quant2" &
+                   msCN$Fusiform.CN == "quant2" &
+                   msCN$ICV.CN == "quant1",
+            c(1, 9:20)]) %>%
+  filter(!is.na(id))
+
+# choose c(467, 645) (quant1 vs. quant2) likely (467, 647)
+
+# different APOE4 alleles
+x <- unique(msCN[,c(1, 9:20)]) %>% 
+  group_by(PTGENDER, AGE, MMSE.CN, RAVLT.immediate.CN, RAVLT.forgetting.CN, 
+           TRABSCOR.CN, FAQ.CN, Ventricles.CN, Hippocampus.CN,
+           Fusiform.CN, ICV.CN) %>% 
+  filter(n() > 1) %>%
+  arrange(.by_group = T)
+
+y <- unique(msCN[msCN$PTGENDER == "Female" & 
+                   msCN$AGE == 66 & 
+                   msCN$MMSE.CN == "quant2" &
+                   msCN$RAVLT.immediate.CN == "quant2" & 
+                   msCN$RAVLT.forgetting.CN == "quant1" & 
+                   msCN$TRABSCOR.CN == "quant1" & 
+                   msCN$FAQ.CN == "quant1" & 
+                   msCN$Ventricles.CN == "quant1" &
+                   msCN$Hippocampus.CN == "quant2" &
+                   msCN$Fusiform.CN == "quant2" &
+                   msCN$ICV.CN == "quant1",
+            c(1, 9:20)]) %>%
+  filter(!is.na(id))
+
+# choose c(636, 426, 574) (0 vs. 1 vs. 2) likely (638, 426, 575)
+
+rm(x,y)
+```
+
+
+The study numbers for the 
+- Ages: ID's 598, 545, 619 (59 vs. 69 vs. 81)
+- Sexes: ID's 323, 637 (Male vs. Female)
+- MMSE quantiles: ID's 467, 645 (quant1 vs. quant2)
+- APOE4 alleles: ID's 636, 426, 574 (0 vs. 1 vs. 2)
+
+Comparison between state occupation probabilities, for *different ages*:
+Ages: ID's 598, 545, 619 (59 vs. 69 vs. 81)
+
+```{r}
+age.ids <- c(599, 545, 620)
+pt.age.prob <- vector(mode = "list", length = length(age.ids))
+pt.age.plots <- list()
+
+for(i in 1:length(age.ids)){
+  wh <- which(msCN$id == age.ids[i])
+  pt <- msCN[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- 1
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfage <- msfit(cfull.CN, pt, trans = tmat_CN)
+
+  pt.age.prob[[i]] <- probtrans(msfage, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(age.ids)){
+  pt.age.plots[[i]] <- plot(pt.age.prob[[i]], 
+     main = list(paste0("Patient ", i, ": aged ", unique(msCN$AGE[msCN$id == age.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(0,15), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(wh, pt, msfage, age.ids)
+```
+
+
+Comparison between state occupation probabilities, for *different sexes*:
+Sexes: ID's 323, 637 (Male vs. Female)
+
+```{r}
+sex.ids <- c(323, 639)
+sex <- c("Female", "Male")
+pt.sex.prob <- vector(mode = "list", length = length(sex.ids))
+pt.sex.plots <- list()
+
+for(i in 1:length(sex.ids)){
+  wh <- which(msCN$id == sex.ids[i])
+  pt <- msCN[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- sex[i]
+  pt[10,"APOE4"] <- 1
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfsex <- msfit(cfull.CN, pt, trans = tmat_CN)
+
+  pt.sex.prob[[i]] <- probtrans(msfsex, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(sex.ids)){
+  pt.sex.plots[[i]] <- plot(pt.sex.prob[[i]], 
+     main = list(paste0("Patient ", i, ": ", unique(msCN$PTGENDER[msCN$id == sex.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(0,15), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(sex, wh, pt, msfsex, sex.ids)
+```
+
+Comparison between state occupation probabilities, for *different MMSE quantiles*:
+MMSE quantiles: ID's 467, 645 (quant1 vs. quant2)
+
+```{r}
+MMSE.ids <- c(467, 647)
+MMSEquant <- c("[7,28]", "(28,30]")
+pt.MMSE.prob <- vector(mode = "list", length = length(MMSE.ids))
+pt.MMSE.plots <- list()
+
+for(i in 1:length(MMSE.ids)){
+  wh <- which(msCN$id == MMSE.ids[i])
+  pt <- msCN[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- 0
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfMMSE <- msfit(cfull.CN, pt, trans = tmat_CN)
+
+  pt.MMSE.prob[[i]] <- probtrans(msfMMSE, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(MMSE.ids)){
+  pt.MMSE.plots[[i]] <- plot(pt.MMSE.prob[[i]], 
+     main = list(paste0("Patient ", i, ": MMSE in", MMSEquant[i]), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(0,15), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(MMSEquant, wh, pt, msfMMSE, MMSE.ids)
+```
+
+Comparison between state occupation probabilities, for *different APOE4 alleles*:
+APOE4 alleles: ID's 636, 426, 574 (0 vs. 1 vs. 2)
+
+```{r}
+APOE.ids <- c(638, 426, 575)
+apoes <- c(1,2,0)
+pt.APOE.prob <- vector(mode = "list", length = length(APOE.ids))
+pt.APOE.plots <- list()
+
+for(i in 1:length(APOE.ids)){
+  wh <- which(msCN$id == APOE.ids[i])
+  pt <- msCN[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- apoes[i]
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfAPOE <- msfit(cfull.CN, pt, trans = tmat_CN)
+
+  pt.APOE.prob[[i]] <- probtrans(msfAPOE, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(APOE.ids)){
+  pt.APOE.plots[[i]] <- plot(pt.APOE.prob[[i]], 
+     main = list(paste0("Patient ", i, ": APOE allele", unique(msCN$APOE4[msCN$id == APOE.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(0,15), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(apoes, wh, pt, msfAPOE, APOE.ids)
+```
+
+
+## Fitting the model using msfit on the age-scale 
+
+Next, we repeat all steps of the previous subsection on the age scale. 
+
+### Baseline CN 
+
+```{r}
+# create msfit object with shifted Tstart and Tstop
+msCN.age <- msCN %>% 
+  mutate(Tstart = Tstart + AGE,
+         Tstop = Tstop + AGE)
+```
+
+First, we have the model without covariates. 
+
+```{r}
+# msfit 
+c0.CN.age <- coxph(Surv(Tstart, Tstop, status) ~ strata(trans),
+               data = msCN.age, method = "breslow")
+msf0.CN.age <- msfit(object = c0.CN.age, vartype = "greenwood", trans = tmat_CN)
+
+# plot cumulative hazard 
+plot(msf0.CN.age, las = 1, 
+     xlab = "Years since CN diagnosis")
+
+# probtrans
+pt0.CN.age <- probtrans(msf0.CN.age, predt = 0, method = "greenwood")
+
+# plot stacked transition probabilities 
+pdf("agecale_baseline.pdf")
+print(plot(pt0.CN.age, 
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Years since inclusion with CN", cex = 1),
+     xlim = c(50, 95), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F")))
+dev.off()
+```
+
+Then, the model with all transition-specific covariate effects.
+
+```{r}
+# fit full model on categorized data 
+cfull.CN.age <- coxph(Surv(Tstart, Tstop, status) ~ PTGENDERMale.1 + PTGENDERMale.3 + 
+                        PTGENDERMale.4 + PTGENDERMale.5 + PTGENDERMale.7 + 
+                        # AGE.1 + AGE.4 + AGE.5 +
+                        APOE41.1 +
+                        APOE42.1 +
+                        MMSE.CNquant2.1 + MMSE.CNquant2.3 + MMSE.CNquant2.4 + 
+                        RAVLT.immediate.CNquant2.1 + 
+                        RAVLT.forgetting.CNquant2.1 + 
+                        TRABSCOR.CNquant2.1 + 
+                        FAQ.CNquant2.1 +
+                        Ventricles.CNquant2.1 + 
+                        Hippocampus.CNquant2.1 + 
+                        Fusiform.CNquant2.1 +
+                        ICV.CNquant2.1 +
+                        strata(trans), 
+                      data = msCN.age, method = "breslow",
+                      control = coxph.control(iter.max = 100))
+
+# look at model outcomes
+summary(cfull.CN.age)
+```
+
+Checking the proportional hazards assumption:
+
+```{r}
+ph.assump.age <- cox.zph(cfull.CN.age)
+ph.assump.age
+# plot(ph.assump)
+```
+
+Comparison between state occupation probabilities, for *different ages*:
+Ages: ID's 598, 545, 619 (59 vs. 69 vs. 81)
+
+```{r}
+age.ids <- c(599, 545, 620)
+pt.age.prob_age <- vector(mode = "list", length = length(age.ids))
+pt.age.plots_age <- list()
+
+for(i in 1:length(age.ids)){
+  wh <- which(msCN.age$id == age.ids[i])
+  pt <- msCN.age[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- 1
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfage <- msfit(cfull.CN.age, pt, trans = tmat_CN)
+
+  pt.age.prob_age[[i]] <- probtrans(msfage, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(age.ids)){
+  pt.age.plots_age[[i]] <- plot(pt.age.prob_age[[i]], 
+     main = list(paste0("Patient ", i, ": aged ", unique(msCN.age$AGE[msCN.age$id == age.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Age (years)", cex = 1),
+     xlim = c(50,95), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(wh, pt, msfage, age.ids)
+```
+
+Comparison between state occupation probabilities, for *different sexes*:
+Sexes: ID's 323, 637 (Male vs. Female)
+
+```{r}
+sex.ids <- c(323, 639)
+sex <- c("Female", "Male")
+pt.sex.prob_age <- vector(mode = "list", length = length(sex.ids))
+pt.sex.plots_age <- list()
+
+for(i in 1:length(sex.ids)){
+  wh <- which(msCN.age$id == sex.ids[i])
+  pt <- msCN.age[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- sex[i]
+  pt[10,"APOE4"] <- 1
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfsex <- msfit(cfull.CN.age, pt, trans = tmat_CN)
+
+  pt.sex.prob_age[[i]] <- probtrans(msfsex, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(sex.ids)){
+  pt.sex.plots_age[[i]] <- plot(pt.sex.prob_age[[i]], 
+     main = list(paste0("Patient ", i, ": ", unique(msCN.age$PTGENDER[msCN.age$id == sex.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Age (years)", cex = 1),
+     xlim = c(50,95), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(sex, wh, pt, msfsex, sex.ids)
+```
+
+Comparison between state occupation probabilities, for *different MMSE quantiles*:
+MMSE quantiles: ID's 467, 645 (quant1 vs. quant2)
+
+```{r}
+MMSE.ids <- c(467, 647)
+MMSEquant <- c("[7,28]", "(28,30]")
+pt.MMSE.prob_age <- vector(mode = "list", length = length(MMSE.ids))
+pt.MMSE.plots_age <- list()
+
+for(i in 1:length(MMSE.ids)){
+  wh <- which(msCN.age$id == MMSE.ids[i])
+  pt <- msCN.age[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- 0
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfMMSE <- msfit(cfull.CN.age, pt, trans = tmat_CN)
+
+  pt.MMSE.prob_age[[i]] <- probtrans(msfMMSE, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(MMSE.ids)){
+  pt.MMSE.plots_age[[i]] <- plot(pt.MMSE.prob_age[[i]], 
+     main = list(paste0("Patient ", i, ": MMSE in", MMSEquant[i]), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Age (years)", cex = 1),
+     xlim = c(50,95), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(MMSEquant, wh, pt, msfMMSE, MMSE.ids)
+```
+
+Comparison between state occupation probabilities, for *different APOE4 alleles*:
+APOE4 alleles: ID's 636, 426, 574 (0 vs. 1 vs. 2)
+
+```{r}
+APOE.ids <- c(638, 426, 575)
+apoes <- c(1,2,0)
+pt.APOE.prob_age <- vector(mode = "list", length = length(APOE.ids))
+pt.APOE.plots_age <- list()
+
+for(i in 1:length(APOE.ids)){
+  wh <- which(msCN.age$id == APOE.ids[i])
+  pt <- msCN.age[rep(wh[1], 9), 9:20]
+  pt$trans <- 1:9
+
+  pt <- rbind(pt, pt[9,]) 
+  pt[10,"PTGENDER"] <- "Male"
+  pt[10,"APOE4"] <- apoes[i]
+
+  attr(pt, "trans") <- tmat_CN
+  pt <- expand.covs(pt, covs.CN)
+  pt <- pt[1:9,]
+
+  pt$strata <- pt$trans
+  msfAPOE <- msfit(cfull.CN.age, pt, trans = tmat_CN)
+
+  pt.APOE.prob_age[[i]] <- probtrans(msfAPOE, predt = 0)
+}
+
+# plot state occupation probabilities with ggplot
+for(i in 1:length(APOE.ids)){
+  pt.APOE.plots_age[[i]] <- plot(pt.APOE.prob_age[[i]], 
+     main = list(paste0("Patient ", i, ": APOE allele", unique(msCN.age$APOE4[msCN.age$id == APOE.ids[i]])), cex = 1.6),
+     ord = c(5,4,3,2,1),
+     las = 1, 
+     xlab = list("Age (years)", cex = 1),
+     xlim = c(50,95), 
+     type = "filled",
+     use.ggplot = T,
+     cols = c("red2", "orange", "light yellow", "light green", "#00B81F"))
+}
+
+#rm(apoes, wh, pt, msfAPOE, APOE.ids)
+```
+
+
+# Saving all state occuption probability-plots to pdf's
+
+## Study scale 
+
+```{r, eval = F}
+# age
+for (i in 1:length(age.ids)) {
+    file_name = paste("studyscale_age", unique(msCN$AGE[msCN$id == age.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.age.plots[[i]])
+    dev.off()
+}
+
+# sex
+for (i in 1:length(sex.ids)) {
+    file_name = paste("studyscale_sex", unique(msCN$PTGENDER[msCN$id == sex.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.age.plots[[i]])
+    dev.off()
+}
+
+# MMSE
+for (i in 1:length(MMSE.ids)) {
+    file_name = paste("studyscale_MMSE", MMSEquant[i], ".pdf", sep="")
+    pdf(file_name)
+    print(pt.MMSE.plots[[i]])
+    dev.off()
+}
+
+# APOE
+for (i in 1:length(APOE.ids)) {
+    file_name = paste("studyscale_APOE", unique(msCN$APOE4[msCN$id == APOE.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.APOE.plots[[i]])
+    dev.off()
+}
+```
+
+## Age scale 
+
+```{r, eval = F}
+# age
+for (i in 1:length(age.ids)) {
+    file_name = paste("agescale_age", unique(msCN.age$AGE[msCN.age$id == age.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.age.plots_age[[i]])
+    dev.off()
+}
+
+# sex
+for (i in 1:length(sex.ids)) {
+    file_name = paste("agescale_sex", unique(msCN.age$PTGENDER[msCN.age$id == sex.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.sex.plots_age[[i]])
+    dev.off()
+}
+
+# MMSE
+for (i in 1:length(MMSE.ids)) {
+    file_name = paste("agescale_MMSE", MMSEquant[i], ".pdf", sep="")
+    pdf(file_name)
+    print(pt.MMSE.plots_age[[i]])
+    dev.off()
+}
+
+# APOE
+for (i in 1:length(APOE.ids)) {
+    file_name = paste("agescale_APOE", unique(msCN.age$APOE4[msCN.age$id == APOE.ids[i]]), ".pdf", sep="")
+    pdf(file_name)
+    print(pt.APOE.plots_age[[i]])
+    dev.off()
+}
+```
+
+
+
